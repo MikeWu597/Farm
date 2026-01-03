@@ -18,6 +18,8 @@
 #include "lwip/inet.h"
 #include "esp_mac.h"
 
+#include "cam_uploader.h"
+
 #define EXAMPLE_ESP_WIFI_SSID      "ESP32_PROV"
 #define EXAMPLE_ESP_WIFI_PASS      "12345678"
 #define EXAMPLE_MAX_STA_CONN       4
@@ -76,6 +78,16 @@ static const char *config_page_html =
 "    <button type='submit'>Connect</button>"
 "  </div>"
 "</form>"
+"<h2>Uploader Configuration</h2>"
+"<form action='/uploader_save' method='post'>"
+"  <div class='container'>"
+"    <label for='url'><b>POST URL</b></label>"
+"    <input type='text' placeholder='http(s)://example.com/upload' name='url'>"
+"    <label for='interval'><b>Interval (seconds)</b></label>"
+"    <input type='text' placeholder='60' name='interval'>"
+"    <button type='submit'>Save Uploader Settings</button>"
+"  </div>"
+"</form>"
 "</body>"
 "</html>";
 
@@ -95,10 +107,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "Disconnected from WiFi, trying to reconnect...");
+        cam_uploader_set_wifi_connected(false);
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "Got IP:" IPSTR, IP2STR(&event->ip_info.ip));
+        cam_uploader_set_wifi_connected(true);
     }
 }
 
@@ -185,6 +199,63 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// HTTP POST handler for saving uploader settings
+static esp_err_t uploader_save_post_handler(httpd_req_t *req)
+{
+    char content[512];
+    size_t recv_size = MIN(req->content_len, sizeof(content) - 1);
+
+    int ret = httpd_req_recv(req, content, recv_size);
+    if (ret <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    content[recv_size] = '\0';
+
+    cam_uploader_config_t cfg;
+    cam_uploader_get_config(&cfg);
+
+    // Parse URL
+    char *url_ptr = strstr(content, "url=");
+    if (url_ptr) {
+        url_ptr += 4;
+        char *url_end = strchr(url_ptr, '&');
+        size_t len = url_end ? (size_t)(url_end - url_ptr) : strlen(url_ptr);
+        if (len >= sizeof(cfg.url)) {
+            len = sizeof(cfg.url) - 1;
+        }
+        memcpy(cfg.url, url_ptr, len);
+        cfg.url[len] = '\0';
+    }
+
+    // Parse interval
+    char *int_ptr = strstr(content, "interval=");
+    if (int_ptr) {
+        int_ptr += 9;
+        cfg.interval_sec = atoi(int_ptr);
+        if (cfg.interval_sec < 1) {
+            cfg.interval_sec = 1;
+        }
+    }
+
+    esp_err_t err = cam_uploader_set_config(&cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save uploader config: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to save uploader config");
+        return ESP_FAIL;
+    }
+
+    const char *response =
+        "<html><body><h1>Uploader settings saved</h1>"
+        "<p>URL and interval have been updated.</p>"
+        "<p><a href='/'>Back</a></p>"
+        "</body></html>";
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 // Start web server
 static httpd_handle_t start_webserver(void)
 {
@@ -209,6 +280,15 @@ static httpd_handle_t start_webserver(void)
             .user_ctx  = NULL
         };
         httpd_register_uri_handler(server, &save_uri);
+
+        // URI handler for saving uploader config
+        httpd_uri_t uploader_uri = {
+            .uri       = "/uploader_save",
+            .method    = HTTP_POST,
+            .handler   = uploader_save_post_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &uploader_uri);
         
         return server;
     }
@@ -315,6 +395,10 @@ void app_main(void)
       ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+
+    // Uploader config/task init (does not require WiFi to be connected)
+    ESP_ERROR_CHECK(cam_uploader_init());
+    ESP_ERROR_CHECK(cam_uploader_start());
     
     ESP_LOGI(TAG, "Starting WiFi provisioning example");
     
@@ -357,6 +441,14 @@ void app_main(void)
                 ESP_LOGI(TAG, "Web server started. Connect to SSID '%s' with password '%s'", 
                         EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
                 ESP_LOGI(TAG, "Then open http://192.168.4.1 in your browser to configure WiFi");
+            }
+        }
+
+        // Start web server also in STA mode to allow parameter adjustment
+        if (!server) {
+            server = start_webserver();
+            if (server) {
+                ESP_LOGI(TAG, "Web server started on STA (open http://<device_ip>/)");
             }
         }
     } else {
