@@ -10,6 +10,7 @@ extern "C" {
 
 typedef struct {
     char url[256];
+    char voltage_url[256];
     int interval_sec;
 } cam_uploader_config_t;
 

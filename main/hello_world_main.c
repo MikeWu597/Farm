@@ -33,6 +33,49 @@ static esp_netif_t *ap_netif = NULL;
 static esp_netif_t *sta_netif = NULL;
 static httpd_handle_t server = NULL;
 
+static bool html_escape_attr(const char *in, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return false;
+    }
+    if (!in) {
+        out[0] = '\0';
+        return true;
+    }
+
+    size_t oi = 0;
+    for (size_t ii = 0; in[ii] != '\0'; ii++) {
+        const char *rep = NULL;
+        switch (in[ii]) {
+        case '&': rep = "&amp;"; break;
+        case '<': rep = "&lt;"; break;
+        case '>': rep = "&gt;"; break;
+        case '"': rep = "&quot;"; break;
+        case '\'': rep = "&#39;"; break;
+        default: rep = NULL; break;
+        }
+
+        if (rep) {
+            size_t rl = strlen(rep);
+            if (oi + rl + 1 > out_len) {
+                out[0] = '\0';
+                return false;
+            }
+            memcpy(out + oi, rep, rl);
+            oi += rl;
+        } else {
+            if (oi + 2 > out_len) {
+                out[0] = '\0';
+                return false;
+            }
+            out[oi++] = in[ii];
+        }
+    }
+
+    out[oi] = '\0';
+    return true;
+}
+
 // HTML code for the configuration page
 static const char *config_page_html = 
 "<!DOCTYPE html>"
@@ -83,6 +126,8 @@ static const char *config_page_html =
 "  <div class='container'>"
 "    <label for='url'><b>POST URL</b></label>"
 "    <input type='text' placeholder='http(s)://example.com/upload' name='url'>"
+"    <label for='vurl'><b>Voltage POST URL</b></label>"
+"    <input type='text' placeholder='http(s)://example.com/voltage' name='vurl'>"
 "    <label for='interval'><b>Interval (seconds)</b></label>"
 "    <input type='text' placeholder='60' name='interval'>"
 "    <button type='submit'>Save Uploader Settings</button>"
@@ -119,7 +164,62 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 // HTTP GET handler for root page
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    httpd_resp_send(req, config_page_html, HTTPD_RESP_USE_STRLEN);
+    cam_uploader_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    (void)cam_uploader_get_config(&cfg);
+
+    char url_esc[600];
+    char vurl_esc[600];
+    if (!html_escape_attr(cfg.url, url_esc, sizeof(url_esc))) {
+        url_esc[0] = '\0';
+    }
+    if (!html_escape_attr(cfg.voltage_url, vurl_esc, sizeof(vurl_esc))) {
+        vurl_esc[0] = '\0';
+    }
+
+    char page[2600];
+    int n = snprintf(
+        page,
+        sizeof(page),
+        "<!DOCTYPE html>"
+        "<html><head><title>WiFi Configuration</title>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<style>"
+        "body {font-family: Arial, Helvetica, sans-serif;}"
+        "input[type=text], input[type=password] {width: 100%%; padding: 12px 20px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; box-sizing: border-box;}"
+        "button {background-color: #4CAF50; color: white; padding: 14px 20px; margin: 8px 0; border: none; cursor: pointer; width: 100%%;}"
+        "button:hover {opacity: 0.8;}"
+        ".container {padding: 16px;}"
+        "</style></head><body>"
+        "<h2>WiFi Configuration</h2>"
+        "<form action='/save' method='post'><div class='container'>"
+        "<label for='ssid'><b>WiFi SSID</b></label>"
+        "<input type='text' placeholder='Enter SSID' name='ssid' required>"
+        "<label for='password'><b>Password</b></label>"
+        "<input type='password' placeholder='Enter Password' name='password' required>"
+        "<button type='submit'>Connect</button>"
+        "</div></form>"
+        "<h2>Uploader Configuration</h2>"
+        "<form action='/uploader_save' method='post'><div class='container'>"
+        "<label for='url'><b>POST URL</b></label>"
+        "<input type='text' placeholder='http(s)://example.com/upload' name='url' value='%s'>"
+        "<label for='vurl'><b>Voltage POST URL</b></label>"
+        "<input type='text' placeholder='http(s)://example.com/voltage' name='vurl' value='%s'>"
+        "<label for='interval'><b>Interval (seconds)</b></label>"
+        "<input type='text' placeholder='60' name='interval' value='%d'>"
+        "<button type='submit'>Save Uploader Settings</button>"
+        "</div></form>"
+        "</body></html>",
+        url_esc,
+        vurl_esc,
+        cfg.interval_sec);
+
+    if (n < 0 || (size_t)n >= sizeof(page)) {
+        httpd_resp_send(req, config_page_html, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -228,6 +328,19 @@ static esp_err_t uploader_save_post_handler(httpd_req_t *req)
         }
         memcpy(cfg.url, url_ptr, len);
         cfg.url[len] = '\0';
+    }
+
+    // Parse voltage URL
+    char *vurl_ptr = strstr(content, "vurl=");
+    if (vurl_ptr) {
+        vurl_ptr += 5;
+        char *vurl_end = strchr(vurl_ptr, '&');
+        size_t len = vurl_end ? (size_t)(vurl_end - vurl_ptr) : strlen(vurl_ptr);
+        if (len >= sizeof(cfg.voltage_url)) {
+            len = sizeof(cfg.voltage_url) - 1;
+        }
+        memcpy(cfg.voltage_url, vurl_ptr, len);
+        cfg.voltage_url[len] = '\0';
     }
 
     // Parse interval

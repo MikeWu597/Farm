@@ -12,6 +12,9 @@
 #include "esp_http_client.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -45,7 +48,15 @@ static const char *TAG = "cam_uploader";
 
 #define NVS_NS "uploader"
 #define NVS_KEY_URL "url"
+#define NVS_KEY_VOLTAGE_URL "vurl"
 #define NVS_KEY_INTERVAL "interval"
+
+#define VBAT_ADC_UNIT ADC_UNIT_1
+#define VBAT_ADC_CHANNEL ADC_CHANNEL_0
+#define VBAT_ADC_ATTEN ADC_ATTEN_DB_12
+#define VBAT_DIVIDER_NUM 2
+#define VBAT_DIVIDER_DEN 1
+#define VBAT_APPROX_FULLSCALE_MV 3300
 
 static SemaphoreHandle_t s_lock;
 static cam_uploader_config_t s_cfg;
@@ -455,6 +466,7 @@ static void cfg_set_defaults(cam_uploader_config_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->interval_sec = 60;
     cfg->url[0] = '\0';
+    cfg->voltage_url[0] = '\0';
 }
 
 static esp_err_t nvs_load_cfg(cam_uploader_config_t *cfg)
@@ -476,6 +488,15 @@ static esp_err_t nvs_load_cfg(cam_uploader_config_t *cfg)
         normalize_url_inplace(cfg->url, sizeof(cfg->url));
     }
 
+    size_t vurl_len = sizeof(cfg->voltage_url);
+    err = nvs_get_str(h, NVS_KEY_VOLTAGE_URL, cfg->voltage_url, &vurl_len);
+    if (err != ESP_OK) {
+        cfg->voltage_url[0] = '\0';
+    } else {
+        cfg->voltage_url[sizeof(cfg->voltage_url) - 1] = '\0';
+        normalize_url_inplace(cfg->voltage_url, sizeof(cfg->voltage_url));
+    }
+
     int32_t interval = 0;
     err = nvs_get_i32(h, NVS_KEY_INTERVAL, &interval);
     if (err == ESP_OK && interval > 0) {
@@ -495,6 +516,9 @@ static esp_err_t nvs_save_cfg(const cam_uploader_config_t *cfg)
     }
 
     err = nvs_set_str(h, NVS_KEY_URL, cfg->url);
+    if (err == ESP_OK) {
+        err = nvs_set_str(h, NVS_KEY_VOLTAGE_URL, cfg->voltage_url);
+    }
     if (err == ESP_OK) {
         err = nvs_set_i32(h, NVS_KEY_INTERVAL, (int32_t)cfg->interval_sec);
     }
@@ -544,6 +568,8 @@ esp_err_t cam_uploader_set_config(const cam_uploader_config_t *cfg)
     cam_uploader_config_t cleaned = *cfg;
     cleaned.url[sizeof(cleaned.url) - 1] = '\0';
     normalize_url_inplace(cleaned.url, sizeof(cleaned.url));
+    cleaned.voltage_url[sizeof(cleaned.voltage_url) - 1] = '\0';
+    normalize_url_inplace(cleaned.voltage_url, sizeof(cleaned.voltage_url));
     if (cleaned.interval_sec < 1) {
         cleaned.interval_sec = 1;
     }
@@ -700,6 +726,134 @@ static esp_err_t http_post_jpeg(const char *url, const uint8_t *buf, size_t len)
     return ESP_OK;
 }
 
+static esp_err_t read_supply_voltage_mv(int *out_mv)
+{
+    if (!out_mv) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    adc_oneshot_unit_handle_t unit = NULL;
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = VBAT_ADC_UNIT,
+    };
+    esp_err_t err = adc_oneshot_new_unit(&init_cfg, &unit);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = VBAT_ADC_ATTEN,
+    };
+    err = adc_oneshot_config_channel(unit, VBAT_ADC_CHANNEL, &chan_cfg);
+    if (err != ESP_OK) {
+        adc_oneshot_del_unit(unit);
+        return err;
+    }
+
+    int raw = 0;
+    err = adc_oneshot_read(unit, VBAT_ADC_CHANNEL, &raw);
+
+    int mv = 0;
+    adc_cali_handle_t cali = NULL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id = VBAT_ADC_UNIT,
+        .chan = VBAT_ADC_CHANNEL,
+        .atten = VBAT_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &cali) == ESP_OK) {
+        calibrated = true;
+    }
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = VBAT_ADC_UNIT,
+        .chan = VBAT_ADC_CHANNEL,
+        .atten = VBAT_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &cali) == ESP_OK) {
+        calibrated = true;
+    }
+#endif
+
+    if (err == ESP_OK) {
+        if (calibrated && cali) {
+            if (adc_cali_raw_to_voltage(cali, raw, &mv) != ESP_OK) {
+                mv = (raw * VBAT_APPROX_FULLSCALE_MV) / 4095;
+            }
+        } else {
+            mv = (raw * VBAT_APPROX_FULLSCALE_MV) / 4095;
+        }
+
+        mv = (mv * VBAT_DIVIDER_NUM) / VBAT_DIVIDER_DEN;
+        *out_mv = mv;
+    }
+
+    if (calibrated && cali) {
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+        (void)adc_cali_delete_scheme_curve_fitting(cali);
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+        (void)adc_cali_delete_scheme_line_fitting(cali);
+#endif
+    }
+    adc_oneshot_del_unit(unit);
+    return err;
+}
+
+static esp_err_t http_post_voltage_mv(const char *url, int voltage_mv)
+{
+    if (!url || url[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char url_buf[256];
+    const char *use_url = url;
+    if (strchr(url, '%') && url_percent_decode(url, url_buf, sizeof(url_buf))) {
+        if (strncmp(url_buf, "http://", 7) == 0 || strncmp(url_buf, "https://", 8) == 0) {
+            use_url = url_buf;
+        }
+    }
+
+    esp_http_client_config_t config = {
+        .url = use_url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 15000,
+    };
+
+#if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+    config.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    char body[32];
+    snprintf(body, sizeof(body), "%d", voltage_mv);
+
+    esp_http_client_set_header(client, "Content-Type", "text/plain");
+    esp_http_client_set_post_field(client, body, (int)strlen(body));
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Voltage POST failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (status < 200 || status >= 300) {
+        ESP_LOGW(TAG, "Voltage POST http status=%d", status);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 static void uploader_task(void *arg)
 {
     (void)arg;
@@ -736,6 +890,16 @@ static void uploader_task(void *arg)
             ESP_LOGW(TAG, "frame format not JPEG (%d)", fb->format);
             esp_camera_fb_return(fb);
         } else {
+            if (cfg.voltage_url[0] != '\0') {
+                int voltage_mv = 0;
+                esp_err_t v_err = read_supply_voltage_mv(&voltage_mv);
+                if (v_err == ESP_OK) {
+                    (void)http_post_voltage_mv(cfg.voltage_url, voltage_mv);
+                } else {
+                    ESP_LOGW(TAG, "read voltage failed: %s", esp_err_to_name(v_err));
+                }
+            }
+
             size_t frame_len = fb->len;
             esp_err_t post_err = http_post_jpeg(cfg.url, fb->buf, fb->len);
             esp_camera_fb_return(fb);
