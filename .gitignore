@@ -1,6 +1,6 @@
 /.devcontainer/
 /.vscode/
 /build/
-/sdk/
+/sdk/build/
 /managed_components/
 dependencies.lock
